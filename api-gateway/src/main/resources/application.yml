@@ -1,0 +1,29 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      routes:
+        - id: user-service
+          uri: http://localhost:8081
+          predicates:
+            - Path=/api/auth/**, /api/users/**
+        - id: post-service
+          uri: http://localhost:8082
+          predicates:
+            - Path=/api/posts/**
+        - id: media-service
+          uri: http://localhost:8083
+          predicates:
+            - Path=/api/media/**
+        - id: feed-service
+          uri: http://localhost:8084
+          predicates:
+            - Path=/api/feed/**
+        - id: notification-service
+          uri: http://localhost:8085
+          predicates:
+            - Path=/api/notifications/**, /ws/**
