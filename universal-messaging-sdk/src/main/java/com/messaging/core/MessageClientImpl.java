@@ -14,6 +14,7 @@ import com.messaging.reliability.Degradation;
 import com.messaging.reliability.DegradationStatus;
 import com.messaging.reliability.Saga;
 import com.messaging.reliability.SagaResult;
+import com.messaging.reliability.impl.*;
 import lombok.extern.slf4j.Slf4j;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -24,6 +25,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Implementation of MessageClient interface.
  * Provides core messaging operations with support for multiple message brokers.
+ * Integrates all reliability handlers: rate limiting, circuit breaking,
+ * deduplication, compression, encryption, retry logic, and dead letter queue handling.
  */
 @Slf4j
 public class MessageClientImpl implements MessageClient {
@@ -31,6 +34,15 @@ public class MessageClientImpl implements MessageClient {
     private final MessageClientConfig config;
     private final MessageProvider provider;
     private final AtomicBoolean closed = new AtomicBoolean(false);
+
+    // Reliability handlers
+    private RateLimiterHandler rateLimiterHandler;
+    private CircuitBreakerHandler circuitBreakerHandler;
+    private CompressionHandler compressionHandler;
+    private EncryptionHandler encryptionHandler;
+    private DeduplicationHandler deduplicationHandler;
+    private RetryExecutor retryExecutor;
+    private DeadLetterQueueHandler deadLetterQueueHandler;
 
     /**
      * Constructor for MessageClientImpl
@@ -42,12 +54,80 @@ public class MessageClientImpl implements MessageClient {
         this.provider = ProviderFactory.create(config.getProviderConfig());
         this.provider.initialize(config.getProviderConfig());
         log.info("MessageClientImpl initialized with provider: {}", provider.getName());
+
+        // Initialize reliability handlers
+        initializeReliabilityHandlers();
+    }
+
+    /**
+     * Initialize all reliability handlers based on configuration
+     */
+    private void initializeReliabilityHandlers() {
+        try {
+            // Initialize RateLimiterHandler
+            if (config.getRateLimit() != null) {
+                this.rateLimiterHandler = new RateLimiterHandler(config.getRateLimit());
+                log.info("RateLimiterHandler initialized");
+            }
+
+            // Initialize CircuitBreakerHandler
+            if (config.getCircuitBreaker() != null) {
+                this.circuitBreakerHandler = new CircuitBreakerHandler(config.getCircuitBreaker());
+                log.info("CircuitBreakerHandler initialized");
+            }
+
+            // Initialize CompressionHandler
+            if (config.getCompression() != null) {
+                this.compressionHandler = new CompressionHandler(config.getCompression());
+                log.info("CompressionHandler initialized");
+            }
+
+            // Initialize EncryptionHandler
+            if (config.getEncryption() != null) {
+                this.encryptionHandler = new EncryptionHandler(config.getEncryption());
+                log.info("EncryptionHandler initialized");
+            }
+
+            // Initialize DeduplicationHandler
+            if (config.getDeduplication() != null) {
+                this.deduplicationHandler = new DeduplicationHandler(config.getDeduplication());
+                log.info("DeduplicationHandler initialized");
+            }
+
+            // Initialize RetryExecutor
+            if (config.getRetryPolicy() != null) {
+                this.retryExecutor = new RetryExecutor(config.getRetryPolicy());
+                log.info("RetryExecutor initialized");
+            }
+
+            // Initialize DeadLetterQueueHandler
+            if (config.getDeadLetterQueue() != null) {
+                this.deadLetterQueueHandler = new DeadLetterQueueHandler(config.getDeadLetterQueue(), provider);
+                log.info("DeadLetterQueueHandler initialized");
+            }
+
+            log.debug("All reliability handlers initialized successfully");
+        } catch (Exception e) {
+            log.error("Error initializing reliability handlers", e);
+            // Continue without handlers - backward compatibility
+        }
     }
 
     @Override
     public <T> SendOperation<T> send(String topic, T payload) {
         log.debug("Creating SendOperation for topic: {}", topic);
-        return new SendOperationImpl<>(this, topic, payload);
+        SendOperationImpl<T> sendOperation = new SendOperationImpl<>(this, topic, payload);
+        // Inject reliability handlers
+        sendOperation.setReliabilityHandlers(
+                rateLimiterHandler,
+                circuitBreakerHandler,
+                compressionHandler,
+                encryptionHandler,
+                deduplicationHandler,
+                retryExecutor,
+                deadLetterQueueHandler
+        );
+        return sendOperation;
     }
 
     @Override
@@ -162,6 +242,17 @@ public class MessageClientImpl implements MessageClient {
     public void close() {
         if (closed.compareAndSet(false, true)) {
             log.info("Closing MessageClientImpl");
+
+            // Shutdown reliability handlers
+            if (deduplicationHandler != null) {
+                try {
+                    deduplicationHandler.shutdown();
+                } catch (Exception e) {
+                    log.error("Error shutting down DeduplicationHandler", e);
+                }
+            }
+
+            // Close provider
             provider.close();
             log.info("MessageClientImpl closed successfully");
         }

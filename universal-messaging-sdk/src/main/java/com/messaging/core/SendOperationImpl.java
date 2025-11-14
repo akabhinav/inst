@@ -2,6 +2,7 @@ package com.messaging.core;
 
 import com.messaging.core.SendOperation.DeliveryGuarantee;
 import com.messaging.core.Message.Priority;
+import com.messaging.reliability.impl.*;
 import lombok.extern.slf4j.Slf4j;
 import reactor.core.publisher.Mono;
 
@@ -15,6 +16,8 @@ import java.util.function.Function;
 /**
  * Implementation of SendOperation interface.
  * Provides fluent builder pattern for configuring and sending messages.
+ * Integrates all reliability handlers: rate limiting, circuit breaking,
+ * deduplication, compression, encryption, retry logic, and dead letter queue handling.
  *
  * @param <T> The type of the message payload
  */
@@ -38,6 +41,15 @@ public class SendOperationImpl<T> implements SendOperation<T> {
     private boolean encrypt = false;
     private DeliveryGuarantee deliveryGuarantee = DeliveryGuarantee.AT_LEAST_ONCE;
 
+    // Reliability handlers (optional - can be null for backward compatibility)
+    private RateLimiterHandler rateLimiterHandler;
+    private CircuitBreakerHandler circuitBreakerHandler;
+    private CompressionHandler compressionHandler;
+    private EncryptionHandler encryptionHandler;
+    private DeduplicationHandler deduplicationHandler;
+    private RetryExecutor retryExecutor;
+    private DeadLetterQueueHandler deadLetterQueueHandler;
+
     /**
      * Constructor for SendOperationImpl
      *
@@ -50,6 +62,27 @@ public class SendOperationImpl<T> implements SendOperation<T> {
         this.topic = topic;
         this.payload = payload;
         log.debug("Created SendOperationImpl for topic: {} with payload type: {}", topic, payload.getClass().getSimpleName());
+    }
+
+    /**
+     * Set reliability handlers (called from MessageClientImpl)
+     */
+    public void setReliabilityHandlers(
+            RateLimiterHandler rateLimiterHandler,
+            CircuitBreakerHandler circuitBreakerHandler,
+            CompressionHandler compressionHandler,
+            EncryptionHandler encryptionHandler,
+            DeduplicationHandler deduplicationHandler,
+            RetryExecutor retryExecutor,
+            DeadLetterQueueHandler deadLetterQueueHandler) {
+        this.rateLimiterHandler = rateLimiterHandler;
+        this.circuitBreakerHandler = circuitBreakerHandler;
+        this.compressionHandler = compressionHandler;
+        this.encryptionHandler = encryptionHandler;
+        this.deduplicationHandler = deduplicationHandler;
+        this.retryExecutor = retryExecutor;
+        this.deadLetterQueueHandler = deadLetterQueueHandler;
+        log.debug("Reliability handlers configured for SendOperationImpl");
     }
 
     @Override
@@ -143,16 +176,92 @@ public class SendOperationImpl<T> implements SendOperation<T> {
             // Build the message with all configured options
             Message<T> message = buildMessage();
 
-            // Send via provider (blocking)
-            SendResult result = client.getProvider()
-                    .send(message)
-                    .block();
+            // Step 1: Check rate limit
+            if (rateLimiterHandler != null && !rateLimiterHandler.tryAcquire()) {
+                log.error("Rate limit exceeded for topic: {}", topic);
+                return SendResult.builder()
+                        .topic(topic)
+                        .success(false)
+                        .error("Rate limit exceeded")
+                        .build();
+            }
 
+            // Step 2: Check circuit breaker
+            if (circuitBreakerHandler != null && !circuitBreakerHandler.allowRequest()) {
+                log.error("Circuit breaker is open for topic: {}", topic);
+                return SendResult.builder()
+                        .topic(topic)
+                        .success(false)
+                        .error("Circuit breaker is open")
+                        .build();
+            }
+
+            // Step 3: Check for duplicates
+            if (deduplicationHandler != null && deduplicationHandler.isDuplicate(message)) {
+                log.warn("Duplicate message detected for topic: {}, message ID: {}", topic, message.getId());
+                return SendResult.builder()
+                        .topic(topic)
+                        .messageId(message.getId())
+                        .success(false)
+                        .error("Duplicate message")
+                        .build();
+            }
+
+            // Step 4: Apply compression if enabled
+            byte[] payload = null;
+            if (compress && compressionHandler != null && message.getPayload() != null) {
+                log.debug("Compressing message for topic: {}", topic);
+                String payloadStr = message.getPayload().toString();
+                byte[] payloadBytes = payloadStr.getBytes();
+                payload = compressionHandler.compress(payloadBytes);
+                message.getHeaders().put("compressed", "true");
+            }
+
+            // Step 5: Apply encryption if enabled
+            if (encrypt && encryptionHandler != null && payload != null) {
+                log.debug("Encrypting message for topic: {}", topic);
+                payload = encryptionHandler.encrypt(payload);
+                message.getHeaders().put("encrypted", "true");
+            }
+
+            // Step 6: Send via provider with retry logic
+            SendResult result = null;
+            if (retryExecutor != null) {
+                log.debug("Sending message with retry logic for topic: {}", topic);
+                result = retryExecutor.execute(() -> {
+                    com.messaging.provider.ProviderSendResult providerResult = client.getProvider()
+                            .send(message)
+                            .block();
+                    return convertToSendResult(providerResult);
+                });
+            } else {
+                // Fallback: send without retry logic
+                log.debug("Sending message without retry logic for topic: {}", topic);
+                com.messaging.provider.ProviderSendResult providerResult = client.getProvider()
+                        .send(message)
+                        .block();
+                result = convertToSendResult(providerResult);
+            }
+
+            // Step 7: Record success/failure in circuit breaker
             if (result != null && result.isSuccess()) {
+                if (circuitBreakerHandler != null) {
+                    circuitBreakerHandler.recordSuccess();
+                }
                 log.info("Message sent successfully to topic: {} with ID: {}", topic, result.getMessageId());
                 return result;
             } else {
+                if (circuitBreakerHandler != null) {
+                    circuitBreakerHandler.recordFailure();
+                }
                 log.error("Message send failed for topic: {}", topic);
+
+                // Step 8: Handle failure in dead letter queue
+                if (deadLetterQueueHandler != null && result != null) {
+                    deadLetterQueueHandler.handleFailedMessage(message,
+                            new Exception("Send operation failed: " + result.getError()));
+                }
+
                 return SendResult.builder()
                         .topic(topic)
                         .success(false)
@@ -161,6 +270,22 @@ public class SendOperationImpl<T> implements SendOperation<T> {
             }
         } catch (Exception e) {
             log.error("Exception during send operation for topic: {}", topic, e);
+
+            // Record failure in circuit breaker
+            if (circuitBreakerHandler != null) {
+                circuitBreakerHandler.recordFailure();
+            }
+
+            // Handle failure in dead letter queue
+            if (deadLetterQueueHandler != null) {
+                try {
+                    Message<T> message = buildMessage();
+                    deadLetterQueueHandler.handleFailedMessage(message, e);
+                } catch (Exception dlqError) {
+                    log.error("Error handling message in dead letter queue", dlqError);
+                }
+            }
+
             return SendResult.builder()
                     .topic(topic)
                     .success(false)
@@ -174,18 +299,108 @@ public class SendOperationImpl<T> implements SendOperation<T> {
         log.info("Executing async send operation for topic: {}", topic);
         return Mono.fromCallable(this::buildMessage)
                 .flatMap(message -> {
+                    // Step 1: Check rate limit
+                    if (rateLimiterHandler != null && !rateLimiterHandler.tryAcquire()) {
+                        log.error("Rate limit exceeded for topic: {}", topic);
+                        return Mono.just(SendResult.builder()
+                                .topic(topic)
+                                .success(false)
+                                .error("Rate limit exceeded")
+                                .build());
+                    }
+
+                    // Step 2: Check circuit breaker
+                    if (circuitBreakerHandler != null && !circuitBreakerHandler.allowRequest()) {
+                        log.error("Circuit breaker is open for topic: {}", topic);
+                        return Mono.just(SendResult.builder()
+                                .topic(topic)
+                                .success(false)
+                                .error("Circuit breaker is open")
+                                .build());
+                    }
+
+                    // Step 3: Check for duplicates
+                    if (deduplicationHandler != null && deduplicationHandler.isDuplicate(message)) {
+                        log.warn("Duplicate message detected for topic: {}, message ID: {}", topic, message.getId());
+                        return Mono.just(SendResult.builder()
+                                .topic(topic)
+                                .messageId(message.getId())
+                                .success(false)
+                                .error("Duplicate message")
+                                .build());
+                    }
+
+                    // Step 4: Apply compression if enabled
+                    if (compress && compressionHandler != null && message.getPayload() != null) {
+                        log.debug("Compressing message for topic: {}", topic);
+                        String payloadStr = message.getPayload().toString();
+                        byte[] payloadBytes = payloadStr.getBytes();
+                        byte[] compressedPayload = compressionHandler.compress(payloadBytes);
+                        message.getHeaders().put("compressed", "true");
+                    }
+
+                    // Step 5: Apply encryption if enabled
+                    if (encrypt && encryptionHandler != null && message.getPayload() != null) {
+                        log.debug("Encrypting message for topic: {}", topic);
+                        String payloadStr = message.getPayload().toString();
+                        byte[] payloadBytes = payloadStr.getBytes();
+                        byte[] encryptedPayload = encryptionHandler.encrypt(payloadBytes);
+                        message.getHeaders().put("encrypted", "true");
+                    }
+
+                    // Step 6: Send via provider with retry logic
                     log.debug("Sending message asynchronously to topic: {}", topic);
-                    return client.getProvider().send(message);
+                    Mono<com.messaging.provider.ProviderSendResult> sendOperation = client.getProvider().send(message);
+
+                    if (retryExecutor != null) {
+                        log.debug("Wrapping with retry logic for topic: {}", topic);
+                        sendOperation = retryExecutor.executeAsync(sendOperation);
+                    }
+
+                    return sendOperation;
                 })
                 .map(this::convertToSendResult)
+                // Step 7: Record success/failure in circuit breaker
                 .doOnSuccess(result -> {
                     if (result.isSuccess()) {
+                        if (circuitBreakerHandler != null) {
+                            circuitBreakerHandler.recordSuccess();
+                        }
                         log.info("Async message sent successfully to topic: {} with ID: {}", topic, result.getMessageId());
                     } else {
+                        if (circuitBreakerHandler != null) {
+                            circuitBreakerHandler.recordFailure();
+                        }
                         log.error("Async message send failed for topic: {}", topic);
                     }
                 })
-                .doOnError(error -> log.error("Exception during async send operation for topic: {}", topic, error));
+                // Step 8: Handle errors with dead letter queue
+                .doOnError(error -> {
+                    log.error("Exception during async send operation for topic: {}", topic, error);
+
+                    // Record failure in circuit breaker
+                    if (circuitBreakerHandler != null) {
+                        circuitBreakerHandler.recordFailure();
+                    }
+
+                    // Handle failure in dead letter queue
+                    if (deadLetterQueueHandler != null) {
+                        try {
+                            Message<T> message = buildMessage();
+                            deadLetterQueueHandler.handleFailedMessage(message, error);
+                        } catch (Exception dlqError) {
+                            log.error("Error handling message in dead letter queue", dlqError);
+                        }
+                    }
+                })
+                .onErrorResume(error -> {
+                    // Return a failed result instead of propagating the error
+                    return Mono.just(SendResult.builder()
+                            .topic(topic)
+                            .success(false)
+                            .error(error.getMessage())
+                            .build());
+                });
     }
 
     /**

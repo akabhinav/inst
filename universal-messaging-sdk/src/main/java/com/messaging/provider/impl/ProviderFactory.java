@@ -95,15 +95,13 @@ public class ProviderFactory {
 
     /**
      * Create a Kafka provider
-     * TODO: Implement actual KafkaProvider instantiation
      *
      * @param config ProviderConfig
-     * @return MessageProvider (currently returns InMemoryProvider as placeholder)
+     * @return MessageProvider
      */
     private static MessageProvider createKafkaProvider(ProviderConfig config) {
-        // TODO: Import and instantiate actual KafkaProvider when available
-        // For now, return InMemoryProvider as a fallback
-        log.warn("KafkaProvider not yet implemented, using InMemoryProvider");
-        return new InMemoryProvider();
+        KafkaProvider provider = new KafkaProvider();
+        provider.initialize(config);
+        return provider;
     }
 }
